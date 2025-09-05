@@ -1,3 +1,4 @@
+const { App } = require("@slack/bolt");
 import { App } from "@slack/bolt";
 
 /* ENV:

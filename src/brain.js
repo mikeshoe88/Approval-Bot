@@ -3,9 +3,8 @@ const OpenAI = require("openai");
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /**
- * Ask the SLA brain a question. Returns a short, clause-backed answer.
- * Env: OPENAI_API_KEY, SLA_VECTOR_STORE_ID
- * Optional: SLA_HINT
+ * Ask the SLA brain a question. It pulls all file IDs from your vector store
+ * and attaches them to a file_search tool call.
  */
 async function askSla({
   question,
@@ -18,19 +17,32 @@ async function askSla({
     "Prefer carrier-specific guidance. If unsure, say so and request a clear photo and job #.";
 
   try {
+    const storeId = process.env.SLA_VECTOR_STORE_ID;
+    if (!storeId) return "No vector store configured (SLA_VECTOR_STORE_ID).";
+
+    // Pull files from the vector store
+    const page = await client.vectorStores.files.list(storeId, { limit: 50 });
+    const fileIds = (page.data || []).map(f => f.id);
+
+    if (!fileIds.length) {
+      return "Your vector store has no processed files yet. Upload the SLA PDFs and try again.";
+    }
+
+    // Ask with file_search + attachments
     const resp = await client.responses.create({
       model: "gpt-5-mini",
       input: [
         { role: "system", content: system },
-        { role: "user", content: `Audience: ${audience}\nCarrier/Program hint: ${carrierHint}\nQuestion: ${question}` }
+        {
+          role: "user",
+          content: `Audience: ${audience}\nCarrier/Program hint: ${carrierHint}\nQuestion: ${question}`
+        }
       ],
       tools: [{ type: "file_search" }],
-      // IMPORTANT: tool_resources must be nested under extra_body
-      extra_body: {
-        tool_resources: {
-          file_search: { vector_store_ids: [process.env.SLA_VECTOR_STORE_ID] }
-        }
-      }
+      attachments: fileIds.map(id => ({
+        file_id: id,
+        tools: [{ type: "file_search" }]
+      }))
     });
 
     return resp.output_text || "I couldn’t find a clear clause—add a photo or specify the carrier/program.";

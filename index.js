@@ -13,7 +13,7 @@
 //
 // Routing / gating (optional):
 //   CREW_NAME             (e.g. "Kings")
-//   APPROVAL_CHANNEL_ID   = "SAME" (default) or a channel ID Cxxxxx for central approvals
+//   APPROVAL_CHANNEL_ID   = "SAME" (default) or channel ID Cxxxxx for central approvals
 //   ALLOW_ALL_CHANNELS    = "true" to respond anywhere
 //   ALLOWED_CHANNEL_IDS   = "C1,C2,C3" allow-list
 //   TEST_CHANNEL_ID       = "Cxxxx" single test channel
@@ -90,19 +90,25 @@ app.event(/.*/, async ({ event, next }) => {
   await next();
 });
 
-// ── SLA brain (Assistants API + vector store)
+// ── SLA brain (Assistants API + vector store, with caching + preflight)
 let _assistantCache = { id: null, storeId: null };
+const SLA_MODEL = "gpt-4.1-mini";
 
 async function getAssistantId(system) {
   const storeId = process.env.SLA_VECTOR_STORE_ID;
-  if (!oai || !storeId) throw new Error("SLA brain is not configured (OPENAI_API_KEY / SLA_VECTOR_STORE_ID).");
+  if (!oai || !storeId) throw new Error("SLA brain not configured (OPENAI_API_KEY / SLA_VECTOR_STORE_ID).");
 
   if (_assistantCache.id && _assistantCache.storeId === storeId) {
     return _assistantCache.id;
   }
 
+  // Preflight: make sure the vector store is reachable in this project
+  const store = await oai.vectorStores.retrieve(storeId);
+  const filesReady = (store.file_counts?.completed || 0);
+  console.log("Vector store OK:", store.id, "files:", filesReady);
+
   const asst = await oai.beta.assistants.create({
-    model: "gpt-5-mini",
+    model: SLA_MODEL,
     instructions: system,
     tools: [{ type: "file_search" }],
     tool_resources: { file_search: { vector_store_ids: [storeId] } }
@@ -112,7 +118,11 @@ async function getAssistantId(system) {
   return asst.id;
 }
 
-async function askSla({ question, audience = "Crew", carrierHint = process.env.SLA_HINT || "Contractor Connection" }) {
+async function askSla({
+  question,
+  audience = "Crew",
+  carrierHint = process.env.SLA_HINT || "Contractor Connection"
+}) {
   if (!brainReady) {
     return "SLA brain is not configured yet (need OPENAI_API_KEY and SLA_VECTOR_STORE_ID).";
   }
@@ -135,13 +145,12 @@ async function askSla({ question, audience = "Crew", carrierHint = process.env.S
       }]
     });
 
-    // Run the assistant and poll until complete (with a timeout)
+    // Run and poll with progress logs + 90s guard
     let run = await oai.beta.threads.runs.create(thread.id, { assistant_id });
     const started = Date.now();
     while (!["completed", "failed", "cancelled", "expired"].includes(run.status)) {
-      if (Date.now() - started > 45000) { // 45s guard
-        throw new Error("Assistant run timeout");
-      }
+      console.log("Assistant run status:", run.status);
+      if (Date.now() - started > 90000) throw new Error("Assistant run timeout (>90s)");
       await sleep(800);
       run = await oai.beta.threads.runs.retrieve(thread.id, run.id);
     }
@@ -154,10 +163,11 @@ async function askSla({ question, audience = "Crew", carrierHint = process.env.S
     for (const block of (last?.content || [])) {
       if (block.type === "text") text += block.text.value;
     }
+
     return text || "I couldn’t find a clear clause—try specifying the carrier/program or add a photo.";
   } catch (err) {
-    console.error("askSla error:", err?.error?.message || err.message);
-    return "I hit a snag reading the SLA. Double-check my API key and vector store, then try again.";
+    console.error("askSla error (detailed):", err?.error?.message || err.message);
+    return "I hit a snag reading the SLA. Check that the API key and vector store are in the *same OpenAI project*, and that the store has at least one file in Ready status.";
   }
 }
 

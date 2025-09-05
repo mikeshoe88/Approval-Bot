@@ -2,9 +2,10 @@
   "name": "approval-bot",
   "version": "1.0.0",
   "private": true,
+  "main": "index.js",
   "engines": { "node": ">=18" },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@slack/bolt": "^3.18.0",

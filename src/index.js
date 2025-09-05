@@ -1,6 +1,9 @@
-// src/index.js — CommonJS
 const { App } = require("@slack/bolt");
-const { askSla } = require("./brain");
+
+// Safe import of the SLA brain (won't crash if the file is missing)
+let askSla = null;
+try { ({ askSla } = require("./brain")); }
+catch (e) { console.warn("SLA brain not loaded:", e.message); }
 
 /*
 ENV required:

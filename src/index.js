@@ -1,11 +1,17 @@
 // src/index.js — CommonJS
 const { App } = require("@slack/bolt");
+const { askSla } = require("./brain");
 
 /*
 ENV required:
   SLACK_APP_TOKEN        (xapp-..., app-level token with connections:write)
   SLACK_BOT_TOKEN        (xoxb-..., bot token)
   SLACK_SIGNING_SECRET   (signing secret)
+
+OpenAI (for “smart” SLA Q&A):
+  OPENAI_API_KEY=sk-...
+  SLA_VECTOR_STORE_ID=vs_...
+  SLA_HINT=Contractor Connection   (optional default program/carrier hint)
 
 Channel routing:
   APPROVAL_CHANNEL_ID=SAME   -> post Approve/Decline back in the *same* work channel (default)
@@ -19,6 +25,9 @@ Channel gating (pick one, optional):
 Other:
   CREW_NAME=Kings
   APPROVER_IDS=U123,U456                 -> only these users can Approve/Decline (optional)
+
+Slack bot scopes you should have:
+  app_mentions:read, chat:write, files:read, channels:history, groups:history, im:history, commands, channels:join
 */
 
 const app = new App({
@@ -58,7 +67,6 @@ async function ensureInChannel(client, channel) {
   try {
     await client.conversations.join({ channel });
   } catch (e) {
-    // ignore not_in_channel for privates / already_in_channel, etc.
     const code = e?.data?.error;
     if (code && !["already_in_channel", "method_not_supported_for_channel_type", "not_in_channel"].includes(code)) {
       console.log("join warn:", code);
@@ -72,20 +80,48 @@ app.event(/.*/, async ({ event, next }) => {
   await next();
 });
 
-// 1) Mention → ask for photo → "Request approval" button
+// Trigger keywords
 const PROMPT_RE = /(remove|demo|vanity|cabinet|approval|approve)/i;
 
+// 1) Mention → answer via SLA brain (if configured) → also offer approval button when relevant
 app.event("app_mention", async ({ event, client, say }) => {
   try {
     if (!inScopeChannel(event.channel)) return;
 
-    // Try to join this channel (public) so we can post reliably
     await ensureInChannel(client, event.channel);
 
     const text = (event.text || "").replace(/<@[^>]+>/, "").trim();
+    const looksLikeDemo = PROMPT_RE.test(text);
+    const item = parseItem(text);
 
-    if (PROMPT_RE.test(text)) {
-      const item = parseItem(text);
+    const haveBrain = !!(process.env.OPENAI_API_KEY && process.env.SLA_VECTOR_STORE_ID);
+
+    if (haveBrain) {
+      const answer = await askSla({ question: text, audience: "Crew" });
+      await say({ thread_ts: event.ts, text: answer });
+
+      // If it sounds demo-ish, present the approval CTA right after the answer
+      if (looksLikeDemo) {
+        await say({
+          thread_ts: event.ts,
+          text: "Add a photo and press Request approval.",
+          blocks: [
+            {
+              type: "actions",
+              elements: [
+                { type: "button", text: { type: "plain_text", text: "Request approval" },
+                  action_id: "request_approval",
+                  value: JSON.stringify({ channel: event.channel, thread_ts: event.ts, item }) }
+              ]
+            }
+          ]
+        });
+      }
+      return;
+    }
+
+    // No brain configured: just prompt for photo/approval
+    if (looksLikeDemo) {
       await say({
         thread_ts: event.ts,
         text:
@@ -173,7 +209,7 @@ app.action("request_approval", async ({ ack, body, client }) => {
     // Target channel: SAME (default) or central channel ID
     const targetChannel = APPROVAL_CHANNEL === "SAME" ? channel : APPROVAL_CHANNEL;
 
-    // Try to join approvals channel if it's different
+    // Join approvals channel if it's different (public channels only)
     if (targetChannel !== channel) await ensureInChannel(client, targetChannel);
 
     // Post to target — friendly error if it fails

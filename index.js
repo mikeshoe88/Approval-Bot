@@ -13,11 +13,9 @@
 //
 // Routing / gating (optional):
 //   CREW_NAME             (e.g. "Kings")
-//   APPROVAL_CHANNEL_ID   = "SAME" (default) or channel ID Cxxxxx for central approvals
-//   ALLOW_ALL_CHANNELS    = "true" to respond anywhere
-//   ALLOWED_CHANNEL_IDS   = "C1,C2,C3" allow-list
-//   TEST_CHANNEL_ID       = "Cxxxx" single test channel
-//   APPROVER_IDS          = "U1,U2" only these can approve/decline
+//   APPROVAL_CHANNEL_ID   = channel ID Cxxxxx for central approvals  (REQUIRED)
+//   ALLOWED_CHANNEL_IDS   = "C1,C2,C3" allow-list (optional; if blank, allow any job channel)
+//   APPROVER_IDS          = "U1,U2" only these can approve/decline (optional)
 // ───────────────────────────────────────────────────────────────────────────────
 
 const { App } = require("@slack/bolt");
@@ -39,7 +37,6 @@ try {
   console.warn("OpenAI not initialized:", e.message);
 }
 
-
 // Slack app
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -50,12 +47,10 @@ const app = new App({
 
 // ── Config
 const CREW = process.env.CREW_NAME || "Crew";
-const APPROVAL_CHANNEL = (process.env.APPROVAL_CHANNEL_ID || "SAME").trim();
+const APPROVAL_CHANNEL = (process.env.APPROVAL_CHANNEL_ID || "").trim(); // REQUIRED
 
-const ALLOW_ALL = String(process.env.ALLOW_ALL_CHANNELS || "").toLowerCase() === "true";
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNEL_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
-const TEST_CHANNEL = process.env.TEST_CHANNEL_ID || "";
 
 const APPROVER_IDS = (process.env.APPROVER_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
@@ -65,10 +60,9 @@ const brainReady = !!(oai && process.env.SLA_VECTOR_STORE_ID);
 console.log("SLA brain ready:", brainReady, "store:", process.env.SLA_VECTOR_STORE_ID || "none");
 
 // ── Helpers
+// Allow anywhere unless you explicitly set ALLOWED_CHANNEL_IDS
 function inScopeChannel(channelId) {
-  if (ALLOW_ALL) return true;
   if (ALLOWED_CHANNELS.length) return ALLOWED_CHANNELS.includes(channelId);
-  if (TEST_CHANNEL) return channelId === TEST_CHANNEL;
   return true;
 }
 
@@ -264,20 +258,28 @@ app.event("app_mention", async ({ event, client, say }) => {
   }
 });
 
-// 2) Button → require photo → post Approve/Decline in same or central channel
+// 2) Button → require photo → post Approve/Decline ONLY to central channel; decisions back to origin thread
 app.action("request_approval", async ({ ack, body, client }) => {
   await ack();
-  console.log("ACTION: request_approval", body.container?.channel_id || "");
   try {
     const { channel, thread_ts, item } = JSON.parse(body.actions[0].value);
 
+    // Require a management approvals channel
+    if (!APPROVAL_CHANNEL) {
+      await client.chat.postMessage({
+        channel, thread_ts,
+        text: "APPROVAL_CHANNEL_ID is not set to a central channel. Ask an admin to set it in Variables."
+      });
+      return;
+    }
+
+    // Ensure there is at least one photo in the job thread
     const replies = await client.conversations.replies({ channel, ts: thread_ts, limit: 200 });
     const files = (replies.messages || []).flatMap(m => m.files || []);
     const firstImg = files.find(f =>
       (f.mimetype && f.mimetype.startsWith("image/")) ||
       ["jpg","jpeg","png","heic","webp"].includes((f.filetype || "").toLowerCase())
     );
-
     if (!firstImg) {
       await client.chat.postEphemeral({
         channel, user: body.user.id, thread_ts,
@@ -286,14 +288,39 @@ app.action("request_approval", async ({ ack, body, client }) => {
       return;
     }
 
-    const { permalink } = await client.chat.getPermalink({ channel, message_ts: thread_ts });
+    // Build breadcrumbs: origin channel name + thread permalink
+    const [{ permalink }, chanInfo] = await Promise.all([
+      client.chat.getPermalink({ channel, message_ts: thread_ts }),
+      client.conversations.info({ channel })
+    ]);
+    const originName = chanInfo?.channel?.name ? `#${chanInfo.channel.name}` : `<#${channel}>`;
 
+    // Approval card (posted in central approvals channel)
     const approvalBlocks = [
+      {
+        type: "header",
+        text: { type: "plain_text", text: "Demo Approval Request", emoji: true }
+      },
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `*${CREW} is requesting approval to remove ${item}.*\nPlease see picture, there is suspect wet material behind the wall.\n\n<${permalink}|Open original thread>`
+          text: `*${CREW} requests approval to remove:* *${item}*`
+        }
+      },
+      {
+        type: "context",
+        elements: [
+          { type: "mrkdwn", text: `*Origin:* ${originName}` },
+          { type: "mrkdwn", text: `<${permalink}|Open job thread>` }
+        ]
+      },
+      { type: "divider" },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "Crew notes: suspect wet material behind the wall. Minimal demo requested for mitigation/documentation."
         }
       },
       {
@@ -309,34 +336,34 @@ app.action("request_approval", async ({ ack, body, client }) => {
       }
     ];
 
-    const targetChannel = APPROVAL_CHANNEL === "SAME" ? channel : APPROVAL_CHANNEL;
-    if (targetChannel !== channel) await ensureInChannel(client, targetChannel);
+    // Join & post in the central approvals channel
+    await ensureInChannel(client, APPROVAL_CHANNEL); // harmless if already in
+    const msg = await client.chat.postMessage({
+      channel: APPROVAL_CHANNEL,
+      text: `Approval requested: remove ${item} (from ${originName})`,
+      blocks: approvalBlocks
+    });
 
-    try {
-      const msg = await client.chat.postMessage({
-        channel: targetChannel,
-        text: `${CREW} requests approval to remove ${item}.`,
-        blocks: approvalBlocks
-      });
+    // Track mapping for decision callbacks
+    (globalThis._approvals ||= new Map()).set(msg.ts, { channel, thread_ts, requester: body.user.id, item });
 
-      (globalThis._approvals ||= new Map()).set(msg.ts, { channel, thread_ts, requester: body.user.id, item });
-
-      await client.chat.postMessage({
-        channel, thread_ts,
-        text: targetChannel === channel
-          ? "Sent for approval in this thread’s channel. I’ll update here when there’s a decision."
-          : `Sent for approval in <#${targetChannel}>. I’ll update here when there’s a decision.`
-      });
-    } catch (e) {
-      const err = e?.data?.error || e.message;
-      await client.chat.postMessage({
-        channel, thread_ts,
-        text: `I couldn't post in <#${targetChannel}>. Error: *${err}*.\nInvite me there and confirm the channel ID.`
-      });
-      throw e;
-    }
+    // Confirm to the job thread (origin)
+    await client.chat.postMessage({
+      channel, thread_ts,
+      text: `Sent to <#${APPROVAL_CHANNEL}> for approval. I’ll update here when there’s a decision.`
+    });
   } catch (err) {
     console.error("request_approval error:", err);
+    // Best-effort origin-thread error message
+    try {
+      const val = JSON.parse(body.actions?.[0]?.value || "{}");
+      if (val.channel && val.thread_ts) {
+        await client.chat.postMessage({
+          channel: val.channel, thread_ts: val.thread_ts,
+          text: `I couldn’t post in the approvals channel. Error: *${err?.data?.error || err.message}*.`
+        });
+      }
+    } catch {}
   }
 });
 
@@ -379,7 +406,7 @@ const decide = (label) => async ({ ack, body, client }) => {
 app.action("approve_demo", decide("APPROVED ✅"));
 app.action("decline_demo", decide("DECLINED ❌"));
 
-// 4) Approver asks for more info → nudge crew
+// 4) Approver asks for more info → nudge crew in the original thread
 app.action("request_more_info", async ({ ack, body, client }) => {
   await ack();
   try {

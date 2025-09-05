@@ -3,12 +3,22 @@ const { App } = require("@slack/bolt");
 
 /*
 ENV required:
-  SLACK_APP_TOKEN       (xapp-..., app-level token with connections:write)
-  SLACK_BOT_TOKEN       (xoxb-..., bot token)
-  SLACK_SIGNING_SECRET  (signing secret)
-  TEST_CHANNEL_ID       (only respond in this channel; leave blank to reply anywhere invited)
-  APPROVAL_CHANNEL_ID   (where Approve/Decline card is posted)
-  CREW_NAME             (e.g., Kings)
+  SLACK_APP_TOKEN        (xapp-..., app-level token with connections:write)
+  SLACK_BOT_TOKEN        (xoxb-..., bot token)
+  SLACK_SIGNING_SECRET   (signing secret)
+
+Channel routing:
+  APPROVAL_CHANNEL_ID=SAME   -> post Approve/Decline back in the *same* work channel (default)
+  APPROVAL_CHANNEL_ID=Cxxxxx -> post into a central approvals channel
+
+Channel gating (pick one, optional):
+  ALLOW_ALL_CHANNELS=true                -> respond anywhere bot is invited
+  ALLOWED_CHANNEL_IDS=C1,C2,C3           -> only these channels
+  TEST_CHANNEL_ID=Cxxxxxx                -> only this single channel
+
+Other:
+  CREW_NAME=Kings
+  APPROVER_IDS=U123,U456                 -> only these users can Approve/Decline (optional)
 */
 
 const app = new App({
@@ -18,34 +28,66 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN
 });
 
-const TEST_CHANNEL     = process.env.TEST_CHANNEL_ID || "";
-const APPROVAL_CHANNEL = process.env.APPROVAL_CHANNEL_ID || "";
-const CREW             = process.env.CREW_NAME || "Crew";
+// --- Config
+const CREW = process.env.CREW_NAME || "Crew";
+const APPROVAL_CHANNEL = (process.env.APPROVAL_CHANNEL_ID || "SAME").trim();
 
-// Optional: quick event logger to help debugging
-app.event(/.*/, async ({ event, next }) => {
-  try { console.log("EVENT:", event.type, event.channel || ""); } catch {}
-  await next();
-});
+const ALLOW_ALL = String(process.env.ALLOW_ALL_CHANNELS || "").toLowerCase() === "true";
+const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNEL_IDS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const TEST_CHANNEL = process.env.TEST_CHANNEL_ID || "";
 
-// Utility: pull "item" from text
+const APPROVER_IDS = (process.env.APPROVER_IDS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+
+// --- Helpers
+function inScopeChannel(channelId) {
+  if (ALLOW_ALL) return true;
+  if (ALLOWED_CHANNELS.length) return ALLOWED_CHANNELS.includes(channelId);
+  if (TEST_CHANNEL) return channelId === TEST_CHANNEL;
+  return true; // default: respond anywhere we're invited
+}
+
 function parseItem(text) {
   const m = (text || "").match(/remove\s+([a-z0-9\-\s]+)/i);
   return (m?.[1] || "item").trim();
 }
 
-// 1) Mention → ask for photo → "Request approval" button
-app.event("app_mention", async ({ event, say }) => {
+async function ensureInChannel(client, channel) {
+  // Join public channels if not already in (requires channels:join scope)
   try {
-    if (TEST_CHANNEL && event.channel !== TEST_CHANNEL) return;
+    await client.conversations.join({ channel });
+  } catch (e) {
+    // ignore not_in_channel for privates / already_in_channel, etc.
+    const code = e?.data?.error;
+    if (code && !["already_in_channel", "method_not_supported_for_channel_type", "not_in_channel"].includes(code)) {
+      console.log("join warn:", code);
+    }
+  }
+}
+
+// Optional: event logger
+app.event(/.*/, async ({ event, next }) => {
+  try { console.log("EVENT:", event.type, event.channel || ""); } catch {}
+  await next();
+});
+
+// 1) Mention → ask for photo → "Request approval" button
+const PROMPT_RE = /(remove|demo|vanity|cabinet|approval|approve)/i;
+
+app.event("app_mention", async ({ event, client, say }) => {
+  try {
+    if (!inScopeChannel(event.channel)) return;
+
+    // Try to join this channel (public) so we can post reliably
+    await ensureInChannel(client, event.channel);
 
     const text = (event.text || "").replace(/<@[^>]+>/, "").trim();
 
-    if (/remove|demo|cabinet|vanity|tear.?out/i.test(text)) {
+    if (PROMPT_RE.test(text)) {
       const item = parseItem(text);
       await say({
         thread_ts: event.ts,
-        // Added text to avoid Slack warning and help screen readers/notifications
         text:
           "Send a picture and I’ll request approval to remove. " +
           "Upload 1–2 photos here in this thread, then press Request approval.",
@@ -75,21 +117,21 @@ app.event("app_mention", async ({ event, say }) => {
       return;
     }
 
-    await say({ thread_ts: event.ts, text: "Send a photo and press *Request approval*." });
+    await say({ thread_ts: event.ts, text: "Say what you need (e.g., *remove vanity*) then upload a photo and press *Request approval*." });
   } catch (err) {
     console.error("app_mention error:", err);
     await say({ thread_ts: event.ts, text: "I hit a snag. Try again or ping a manager." });
   }
 });
 
-// 2) Button → require photo → post Approve/Decline in approvals channel (robust + friendly errors)
+// 2) Button → require photo → post Approve/Decline in (same or central) channel
 app.action("request_approval", async ({ ack, body, client }) => {
   await ack();
-  console.log("ACTION: request_approval", body.container?.channel_id || ""); // added log
+  console.log("ACTION: request_approval", body.container?.channel_id || "");
   try {
     const { channel, thread_ts, item } = JSON.parse(body.actions[0].value);
 
-    // Look for any image in the thread (more robust)
+    // Look for any image in the thread (robust)
     const replies = await client.conversations.replies({ channel, ts: thread_ts, limit: 200 });
     const files = (replies.messages || []).flatMap(m => m.files || []);
     const firstImg = files.find(f =>
@@ -121,23 +163,23 @@ app.action("request_approval", async ({ ack, body, client }) => {
           { type: "button", style: "primary", text: { type: "plain_text", text: "Approve" },
             action_id: "approve_demo", value: JSON.stringify({ channel, thread_ts, item, requester: body.user.id }) },
           { type: "button", style: "danger", text: { type: "plain_text", text: "Decline" },
-            action_id: "decline_demo", value: JSON.stringify({ channel, thread_ts, item, requester: body.user.id }) }
+            action_id: "decline_demo", value: JSON.stringify({ channel, thread_ts, item, requester: body.user.id }) },
+          { type: "button", text: { type: "plain_text", text: "Ask for more info" },
+            action_id: "request_more_info", value: JSON.stringify({ channel, thread_ts, item, requester: body.user.id }) }
         ]
       }
     ];
 
-    if (!APPROVAL_CHANNEL) {
-      await client.chat.postMessage({
-        channel, thread_ts,
-        text: "APPROVAL_CHANNEL_ID isn't set. Ask an admin to add it in the service Variables."
-      });
-      return;
-    }
+    // Target channel: SAME (default) or central channel ID
+    const targetChannel = APPROVAL_CHANNEL === "SAME" ? channel : APPROVAL_CHANNEL;
 
-    // Post to approvals channel — show a friendly error if it fails
+    // Try to join approvals channel if it's different
+    if (targetChannel !== channel) await ensureInChannel(client, targetChannel);
+
+    // Post to target — friendly error if it fails
     try {
       const msg = await client.chat.postMessage({
-        channel: APPROVAL_CHANNEL,
+        channel: targetChannel,
         text: `${CREW} requests approval to remove ${item}.`,
         blocks: approvalBlocks
       });
@@ -146,13 +188,15 @@ app.action("request_approval", async ({ ack, body, client }) => {
 
       await client.chat.postMessage({
         channel, thread_ts,
-        text: "Sent for approval. I’ll update here when there’s a decision."
+        text: targetChannel === channel
+          ? "Sent for approval in this thread’s channel. I’ll update here when there’s a decision."
+          : `Sent for approval in <#${targetChannel}>. I’ll update here when there’s a decision.`
       });
     } catch (e) {
       const err = e?.data?.error || e.message;
       await client.chat.postMessage({
         channel, thread_ts,
-        text: `I couldn't post in the approvals channel (${APPROVAL_CHANNEL}). Error: *${err}*.\nMake sure I'm invited there and the channel ID is correct.`
+        text: `I couldn't post in <#${targetChannel}>. Error: *${err}*.\nInvite me there and confirm the channel ID.`
       });
       throw e;
     }
@@ -161,12 +205,21 @@ app.action("request_approval", async ({ ack, body, client }) => {
   }
 });
 
-// 3) Approver clicks → update approval post + notify crew thread
+// 3) Approver clicks → update approval post + notify crew thread (with allow-list)
 const decide = (label) => async ({ ack, body, client }) => {
   await ack();
   try {
     const val = JSON.parse(body.actions[0].value);
     const { channel, thread_ts, requester, item } = val;
+
+    // Allow-list (optional)
+    if (APPROVER_IDS.length && !APPROVER_IDS.includes(body.user.id)) {
+      await client.chat.postEphemeral({
+        channel: body.channel.id, user: body.user.id,
+        text: "Only designated approvers can take this action."
+      });
+      return;
+    }
 
     await client.chat.update({
       channel: body.channel.id, ts: body.message.ts,
@@ -189,6 +242,21 @@ const decide = (label) => async ({ ack, body, client }) => {
 
 app.action("approve_demo", decide("APPROVED ✅"));
 app.action("decline_demo", decide("DECLINED ❌"));
+
+// 4) Approver requests more info → nudge crew in the original thread
+app.action("request_more_info", async ({ ack, body, client }) => {
+  await ack();
+  try {
+    const val = JSON.parse(body.actions[0].value);
+    const { channel, thread_ts, item } = val;
+    await client.chat.postMessage({
+      channel, thread_ts,
+      text: `Need more info to decide on *${item}*:\n• Wide shot of area\n• Close-up of suspect wet material\n• Moisture reading photo (if available)\n• Note any utilities behind`
+    });
+  } catch (err) {
+    console.error("request_more_info error:", err);
+  }
+});
 
 // --- start
 (async () => {

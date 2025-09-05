@@ -1,8 +1,8 @@
-// index.js — Single file Approval Bot (CommonJS)
+// index.js — Single-file Approval Bot (CommonJS)
 
-// ── Env you need ──────────────────────────────────────────────────────────────
+// ── Required env ──────────────────────────────────────────────────────────────
 // Slack:
-//   SLACK_APP_TOKEN       (xapp-..., app-level token, connections:write)
+//   SLACK_APP_TOKEN       (xapp-..., app-level token with connections:write)
 //   SLACK_BOT_TOKEN       (xoxb-...)
 //   SLACK_SIGNING_SECRET
 //
@@ -23,7 +23,7 @@
 const { App } = require("@slack/bolt");
 const OpenAI = require("openai");
 
-// OpenAI client (optional; bot still works without the SLA brain)
+// OpenAI client
 let oai = null;
 try {
   if (process.env.OPENAI_API_KEY) {
@@ -84,13 +84,34 @@ async function ensureInChannel(client, channel) {
   }
 }
 
-// Lightweight logger to help debugging
+// Lightweight event logger
 app.event(/.*/, async ({ event, next }) => {
   try { console.log("EVENT:", event.type, event.channel || ""); } catch {}
   await next();
 });
 
-// ── SLA brain (single-file) — uses file_search + attachments (no extra_body)
+// ── SLA brain (Assistants API + vector store)
+let _assistantCache = { id: null, storeId: null };
+
+async function getAssistantId(system) {
+  const storeId = process.env.SLA_VECTOR_STORE_ID;
+  if (!oai || !storeId) throw new Error("SLA brain is not configured (OPENAI_API_KEY / SLA_VECTOR_STORE_ID).");
+
+  if (_assistantCache.id && _assistantCache.storeId === storeId) {
+    return _assistantCache.id;
+  }
+
+  const asst = await oai.beta.assistants.create({
+    model: "gpt-5-mini",
+    instructions: system,
+    tools: [{ type: "file_search" }],
+    tool_resources: { file_search: { vector_store_ids: [storeId] } }
+  });
+
+  _assistantCache = { id: asst.id, storeId };
+  return asst.id;
+}
+
 async function askSla({ question, audience = "Crew", carrierHint = process.env.SLA_HINT || "Contractor Connection" }) {
   if (!brainReady) {
     return "SLA brain is not configured yet (need OPENAI_API_KEY and SLA_VECTOR_STORE_ID).";
@@ -101,29 +122,43 @@ async function askSla({ question, audience = "Crew", carrierHint = process.env.S
     "demo-first, checklist style. When certain, include the clause/section or filename. " +
     "Prefer carrier-specific guidance. If unsure, say so and request a clear photo and job #.";
 
-  // 1) List files in the vector store
-  const storeId = process.env.SLA_VECTOR_STORE_ID;
-  const page = await oai.vectorStores.files.list(storeId, { limit: 50 });
-  const fileIds = (page.data || []).map(f => f.id);
-  if (!fileIds.length) {
-    return "Your vector store has no processed files yet. Upload the SLA PDFs and try again.";
-  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // 2) Ask with file_search tool + attachments
-  const resp = await oai.responses.create({
-    model: "gpt-5-mini",
-    input: [
-      { role: "system", content: system },
-      {
+  try {
+    const assistant_id = await getAssistantId(system);
+
+    // Create thread with the question
+    const thread = await oai.beta.threads.create({
+      messages: [{
         role: "user",
         content: `Audience: ${audience}\nCarrier/Program hint: ${carrierHint}\nQuestion: ${question}`
-      }
-    ],
-    tools: [{ type: "file_search" }],
-    attachments: fileIds.map(id => ({ file_id: id, tools: [{ type: "file_search" }] }))
-  });
+      }]
+    });
 
-  return resp.output_text || "I couldn’t find a clear clause—add a photo or specify the carrier/program.";
+    // Run the assistant and poll until complete (with a timeout)
+    let run = await oai.beta.threads.runs.create(thread.id, { assistant_id });
+    const started = Date.now();
+    while (!["completed", "failed", "cancelled", "expired"].includes(run.status)) {
+      if (Date.now() - started > 45000) { // 45s guard
+        throw new Error("Assistant run timeout");
+      }
+      await sleep(800);
+      run = await oai.beta.threads.runs.retrieve(thread.id, run.id);
+    }
+    if (run.status !== "completed") throw new Error(`Assistant run ${run.status}`);
+
+    // Read latest assistant message
+    const msgs = await oai.beta.threads.messages.list(thread.id, { order: "desc", limit: 1 });
+    const last = msgs.data?.[0];
+    let text = "";
+    for (const block of (last?.content || [])) {
+      if (block.type === "text") text += block.text.value;
+    }
+    return text || "I couldn’t find a clear clause—try specifying the carrier/program or add a photo.";
+  } catch (err) {
+    console.error("askSla error:", err?.error?.message || err.message);
+    return "I hit a snag reading the SLA. Double-check my API key and vector store, then try again.";
+  }
 }
 
 // ── Triggers

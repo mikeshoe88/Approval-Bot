@@ -52,6 +52,10 @@ const TEST_CHANNEL = process.env.TEST_CHANNEL_ID || "";
 const APPROVER_IDS = (process.env.APPROVER_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
+const brainReady = !!(askSla && process.env.OPENAI_API_KEY && process.env.SLA_VECTOR_STORE_ID);
+console.log("SLA brain ready:", brainReady, "store:", process.env.SLA_VECTOR_STORE_ID || "none");
+
+
 // --- Helpers
 function inScopeChannel(channelId) {
   if (ALLOW_ALL) return true;

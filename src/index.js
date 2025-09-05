@@ -1,3 +1,4 @@
+// src/index.js — CommonJS
 const { App } = require("@slack/bolt");
 
 // Safe import of the SLA brain (won't crash if the file is missing)
@@ -29,7 +30,7 @@ Other:
   CREW_NAME=Kings
   APPROVER_IDS=U123,U456                 -> only these users can Approve/Decline (optional)
 
-Slack bot scopes you should have:
+Slack bot scopes:
   app_mentions:read, chat:write, files:read, channels:history, groups:history, im:history, commands, channels:join
 */
 
@@ -52,9 +53,9 @@ const TEST_CHANNEL = process.env.TEST_CHANNEL_ID || "";
 const APPROVER_IDS = (process.env.APPROVER_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
+// Log whether the SLA brain is ready
 const brainReady = !!(askSla && process.env.OPENAI_API_KEY && process.env.SLA_VECTOR_STORE_ID);
 console.log("SLA brain ready:", brainReady, "store:", process.env.SLA_VECTOR_STORE_ID || "none");
-
 
 // --- Helpers
 function inScopeChannel(channelId) {
@@ -65,12 +66,15 @@ function inScopeChannel(channelId) {
 }
 
 function parseItem(text) {
+  // Try to pull a noun after "remove", otherwise fall back to common items
   const m = (text || "").match(/remove\s+([a-z0-9\-\s]+)/i);
-  return (m?.[1] || "item").trim();
+  if (m?.[1]) return m[1].trim();
+  if (/vanity/i.test(text)) return "vanity";
+  if (/cabinet/i.test(text)) return "cabinet";
+  return "item";
 }
 
 async function ensureInChannel(client, channel) {
-  // Join public channels if not already in (requires channels:join scope)
   try {
     await client.conversations.join({ channel });
   } catch (e) {
@@ -81,7 +85,7 @@ async function ensureInChannel(client, channel) {
   }
 }
 
-// Optional: event logger
+// Optional: light event logger
 app.event(/.*/, async ({ event, next }) => {
   try { console.log("EVENT:", event.type, event.channel || ""); } catch {}
   await next();
@@ -90,7 +94,7 @@ app.event(/.*/, async ({ event, next }) => {
 // Trigger keywords
 const PROMPT_RE = /(remove|demo|vanity|cabinet|approval|approve)/i;
 
-// 1) Mention → answer via SLA brain (if configured) → also offer approval button when relevant
+// 1) Mention → SLA answer (if brain ready) → offer approval button when relevant
 app.event("app_mention", async ({ event, client, say }) => {
   try {
     if (!inScopeChannel(event.channel)) return;
@@ -101,13 +105,12 @@ app.event("app_mention", async ({ event, client, say }) => {
     const looksLikeDemo = PROMPT_RE.test(text);
     const item = parseItem(text);
 
-    const haveBrain = !!(process.env.OPENAI_API_KEY && process.env.SLA_VECTOR_STORE_ID);
+    const haveBrain = !!(askSla && process.env.OPENAI_API_KEY && process.env.SLA_VECTOR_STORE_ID);
 
     if (haveBrain) {
       const answer = await askSla({ question: text, audience: "Crew" });
       await say({ thread_ts: event.ts, text: answer });
 
-      // If it sounds demo-ish, present the approval CTA right after the answer
       if (looksLikeDemo) {
         await say({
           thread_ts: event.ts,
@@ -116,9 +119,12 @@ app.event("app_mention", async ({ event, client, say }) => {
             {
               type: "actions",
               elements: [
-                { type: "button", text: { type: "plain_text", text: "Request approval" },
+                {
+                  type: "button",
+                  text: { type: "plain_text", text: "Request approval" },
                   action_id: "request_approval",
-                  value: JSON.stringify({ channel: event.channel, thread_ts: event.ts, item }) }
+                  value: JSON.stringify({ channel: event.channel, thread_ts: event.ts, item })
+                }
               ]
             }
           ]
@@ -167,19 +173,18 @@ app.event("app_mention", async ({ event, client, say }) => {
   }
 });
 
-// 2) Button → require photo → post Approve/Decline in (same or central) channel
+// 2) Button → require photo → post Approve/Decline in same or central channel
 app.action("request_approval", async ({ ack, body, client }) => {
   await ack();
   console.log("ACTION: request_approval", body.container?.channel_id || "");
   try {
     const { channel, thread_ts, item } = JSON.parse(body.actions[0].value);
 
-    // Look for any image in the thread (robust)
     const replies = await client.conversations.replies({ channel, ts: thread_ts, limit: 200 });
     const files = (replies.messages || []).flatMap(m => m.files || []);
     const firstImg = files.find(f =>
       (f.mimetype && f.mimetype.startsWith("image/")) ||
-      ["jpg","jpeg","png","heic","webp"].includes((f.filetype || "").toLowerCase())
+      ["jpg", "jpeg", "png", "heic", "webp"].includes((f.filetype || "").toLowerCase())
     );
 
     if (!firstImg) {
@@ -213,13 +218,9 @@ app.action("request_approval", async ({ ack, body, client }) => {
       }
     ];
 
-    // Target channel: SAME (default) or central channel ID
     const targetChannel = APPROVAL_CHANNEL === "SAME" ? channel : APPROVAL_CHANNEL;
-
-    // Join approvals channel if it's different (public channels only)
     if (targetChannel !== channel) await ensureInChannel(client, targetChannel);
 
-    // Post to target — friendly error if it fails
     try {
       const msg = await client.chat.postMessage({
         channel: targetChannel,
@@ -255,7 +256,6 @@ const decide = (label) => async ({ ack, body, client }) => {
     const val = JSON.parse(body.actions[0].value);
     const { channel, thread_ts, requester, item } = val;
 
-    // Allow-list (optional)
     if (APPROVER_IDS.length && !APPROVER_IDS.includes(body.user.id)) {
       await client.chat.postEphemeral({
         channel: body.channel.id, user: body.user.id,
@@ -265,7 +265,9 @@ const decide = (label) => async ({ ack, body, client }) => {
     }
 
     await client.chat.update({
-      channel: body.channel.id, ts: body.message.ts,
+      channel: body.channel.id,
+      ts: body.message.ts,
+      text: `${label} recorded`, // add text for accessibility / warnings
       blocks: [
         ...body.message.blocks.filter(b => b.type !== "actions"),
         { type: "context", elements: [{ type: "mrkdwn", text: `*${label}* by <@${body.user.id}> • ${new Date().toLocaleString()}` }] }

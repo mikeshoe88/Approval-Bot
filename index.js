@@ -23,15 +23,22 @@
 const { App } = require("@slack/bolt");
 const OpenAI = require("openai");
 
-// OpenAI client
+// Accept either OPENAI_API_KEY or OPEN_API_KEY (typo-safe)
+const OPENAI_KEY = process.env.OPENAI_API_KEY || process.env.OPEN_API_KEY;
+
 let oai = null;
 try {
-  if (process.env.OPENAI_API_KEY) {
-    oai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  if (OPENAI_KEY) {
+    // Force Assistants v2 explicitly
+    oai = new OpenAI({
+      apiKey: OPENAI_KEY,
+      defaultHeaders: { "OpenAI-Beta": "assistants=v2" }
+    });
   }
 } catch (e) {
   console.warn("OpenAI not initialized:", e.message);
 }
+
 
 // Slack app
 const app = new App({

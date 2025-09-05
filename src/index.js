@@ -45,6 +45,10 @@ app.event("app_mention", async ({ event, say }) => {
       const item = parseItem(text);
       await say({
         thread_ts: event.ts,
+        // Added text to avoid Slack warning and help screen readers/notifications
+        text:
+          "Send a picture and I’ll request approval to remove. " +
+          "Upload 1–2 photos here in this thread, then press Request approval.",
         blocks: [
           {
             type: "section",
@@ -81,6 +85,7 @@ app.event("app_mention", async ({ event, say }) => {
 // 2) Button → require photo → post Approve/Decline in approvals channel (robust + friendly errors)
 app.action("request_approval", async ({ ack, body, client }) => {
   await ack();
+  console.log("ACTION: request_approval", body.container?.channel_id || ""); // added log
   try {
     const { channel, thread_ts, item } = JSON.parse(body.actions[0].value);
 

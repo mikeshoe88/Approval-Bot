@@ -1,0 +1,13 @@
+{
+  "name": "approval-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.18.0"
+  }
+}
